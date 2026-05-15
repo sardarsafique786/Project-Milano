@@ -83,18 +83,38 @@ class DashboardController {
     constructor(apiProvider) {
         this.provider = apiProvider;
         this.kpiContainer = document.getElementById('kpiContainer');
+        
+        // State for Table & Filtering
+        this.fullData = [];
+        this.filteredData = [];
+        this.currentPage = 1;
+        this.rowsPerPage = 10;
+        this.sortCol = 'date';
+        this.sortDesc = true;
+        this.currentFilterDept = null;
+        
         this.init();
     }
 
     init() {
         document.getElementById('refreshBtn').addEventListener('click', () => this.syncUI());
+        
+        const csvBtn = document.getElementById('exportCsv');
+        const pdfBtn = document.getElementById('exportPdf');
+        if(csvBtn) csvBtn.addEventListener('click', (e) => { e.preventDefault(); this.exportCSV(); });
+        if(pdfBtn) pdfBtn.addEventListener('click', (e) => { e.preventDefault(); window.print(); });
+        
+        const prevBtn = document.getElementById('prevPage');
+        const nextBtn = document.getElementById('nextPage');
+        if(prevBtn) prevBtn.addEventListener('click', () => { if(this.currentPage > 1) { this.currentPage--; this.renderTable(); } });
+        if(nextBtn) nextBtn.addEventListener('click', () => { if(this.currentPage * this.rowsPerPage < this.filteredData.length) { this.currentPage++; this.renderTable(); } });
+
         this.syncUI(); 
     }
 
     async syncUI() {
         this.kpiContainer.innerHTML = '<p style="grid-column: 1 / -1; text-align: center; color: var(--text-secondary);">Connecting to Secure API...</p>';
         const tableContainer = document.getElementById('tableContainer');
-        if (tableContainer) tableContainer.innerHTML = '';
         
         const data = await this.provider.fetchDataset();
         
@@ -107,6 +127,10 @@ class DashboardController {
                 </div>`;
             return;
         }
+
+        this.fullData = data;
+        this.filteredData = data;
+        this.currentFilterDept = null;
 
         // Advanced Array Reductions to calculate live KPI stats
         const totalRev = data.reduce((acc, row) => acc + parseFloat(row.total_revenue || 0), 0);
@@ -126,62 +150,118 @@ class DashboardController {
         const prevExp = data.filter(d => parseInt(d.year) === prevYear).reduce((acc, row) => acc + parseFloat(row.total_expense || 0), 0);
         const expTrend = prevExp ? (((latestExp - prevExp) / prevExp) * 100).toFixed(1) : 0;
 
-        const formatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
         
         this.kpiContainer.innerHTML = ''; // Clear previous
         const metrics = [
-            { t: "Global Revenue", v: formatter.format(totalRev), r: `${revTrend > 0 ? '+' : ''}${revTrend}% YoY` },
-            { t: "Global Expenses", v: formatter.format(totalExp), r: `${expTrend > 0 ? '+' : ''}${expTrend}% YoY` },
-            { t: "Net Profitability", v: formatter.format(totalProfit), r: totalProfit > 0 ? "Healthy" : "Critical Loss" }
+            { t: "Global Revenue", v: totalRev, r: `${revTrend > 0 ? '+' : ''}${revTrend}% YoY` },
+            { t: "Global Expenses", v: totalExp, r: `${expTrend > 0 ? '+' : ''}${expTrend}% YoY` },
+            { t: "Net Profitability", v: totalProfit, r: totalProfit > 0 ? "Healthy" : "Critical Loss" }
         ];
+
+        const formatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
 
         metrics.forEach(m => {
             const card = document.createElement('milano-kpi-card');
             card.setAttribute('title', m.t);
-            card.setAttribute('value', m.v);
             card.setAttribute('trend', m.r);
             this.kpiContainer.appendChild(card);
+            
+            // Numeric Count-Up Animation
+            let current = 0;
+            const steps = 30;
+            const inc = m.v / steps;
+            const timer = setInterval(() => {
+                current += inc;
+                if ((inc > 0 && current >= m.v) || (inc < 0 && current <= m.v)) { current = m.v; clearInterval(timer); }
+                card.setAttribute('value', formatter.format(current));
+            }, 30);
         });
 
         // Render Interactive Graphs
         this.renderCharts(data, latestYear);
 
-        // Render Data Table directly from CSV rows
-        if (tableContainer) {
-            let tableHTML = `
-                <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem; background: rgba(15, 23, 42, 0.65); backdrop-filter: blur(12px);">
-                    <thead>
-                        <tr style="border-bottom: 1px solid rgba(255,255,255,0.1); color: var(--text-secondary);">
-                            <th style="padding: 1rem;">Date</th>
-                            <th style="padding: 1rem;">Department</th>
-                            <th style="padding: 1rem;">Total Revenue</th>
-                            <th style="padding: 1rem;">Total Expense</th>
-                            <th style="padding: 1rem;">Net Profit</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-            `;
-            
-            // Show latest 10 rows from CSV
-            const recentData = data.slice(-10).reverse();
-            recentData.forEach(row => {
-                tableHTML += `
-                    <tr style="border-bottom: 1px solid rgba(255,255,255,0.05);">
-                        <td style="padding: 1rem;">${row.month}/${row.year}</td>
-                        <td style="padding: 1rem;">${row.department}</td>
-                        <td style="padding: 1rem; color: #10b981;">${formatter.format(row.total_revenue)}</td>
-                        <td style="padding: 1rem; color: #ef4444;">${formatter.format(row.total_expense)}</td>
-                        <td style="padding: 1rem;">${formatter.format(row.net_profit)}</td>
-                    </tr>
-                `;
-            });
-            
-            tableHTML += `</tbody></table>`;
-            tableContainer.innerHTML = tableHTML;
-        }
+        this.renderTable();
 
         // Render the new Employee Insights section
         this.renderReviews();
+    }
+
+    renderTable() {
+        const tableContainer = document.getElementById('tableContainer');
+        if (!tableContainer) return;
+        
+        // Sorting
+        let sorted = [...this.filteredData].sort((a, b) => {
+            let valA, valB;
+            if (this.sortCol === 'date') {
+                valA = parseInt(a.year) * 12 + parseInt(a.month);
+                valB = parseInt(b.year) * 12 + parseInt(b.month);
+            } else if (this.sortCol === 'department') {
+                valA = a.department; valB = b.department;
+            } else {
+                valA = parseFloat(a[this.sortCol] || 0);
+                valB = parseFloat(b[this.sortCol] || 0);
+            }
+            if (valA < valB) return this.sortDesc ? 1 : -1;
+            if (valA > valB) return this.sortDesc ? -1 : 1;
+            return 0;
+        });
+
+        // Pagination
+        const totalPages = Math.ceil(sorted.length / this.rowsPerPage) || 1;
+        if (this.currentPage > totalPages) this.currentPage = totalPages;
+        const startIdx = (this.currentPage - 1) * this.rowsPerPage;
+        const pageData = sorted.slice(startIdx, startIdx + this.rowsPerPage);
+        
+        const controls = document.getElementById('tableControls');
+        if(controls) {
+            controls.style.display = 'flex';
+            document.getElementById('pageIndicator').innerHTML = `Page <span style="color:#fff">${this.currentPage}</span> of ${totalPages} ${this.currentFilterDept ? '<i>(Filtered)</i>' : ''}`;
+            document.getElementById('prevPage').disabled = this.currentPage === 1;
+            document.getElementById('nextPage').disabled = this.currentPage === totalPages;
+        }
+
+        const formatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+        const getIcon = (col) => this.sortCol === col ? (this.sortDesc ? ' ▼' : ' ▲') : '';
+
+        let tableHTML = `
+            <table style="width: 100%; border-collapse: collapse; text-align: left; font-size: 0.9rem; background: rgba(15, 23, 42, 0.65); backdrop-filter: blur(12px);">
+                <thead>
+                    <tr style="border-bottom: 1px solid rgba(255,255,255,0.1); color: var(--text-secondary);">
+                        <th class="sortable-th" data-col="date" style="padding: 1rem;">Date<span class="sort-icon">${getIcon('date')}</span></th>
+                        <th class="sortable-th" data-col="department" style="padding: 1rem;">Department<span class="sort-icon">${getIcon('department')}</span></th>
+                        <th class="sortable-th" data-col="total_revenue" style="padding: 1rem;">Total Revenue<span class="sort-icon">${getIcon('total_revenue')}</span></th>
+                        <th class="sortable-th" data-col="total_expense" style="padding: 1rem;">Total Expense<span class="sort-icon">${getIcon('total_expense')}</span></th>
+                        <th class="sortable-th" data-col="net_profit" style="padding: 1rem;">Net Profit<span class="sort-icon">${getIcon('net_profit')}</span></th>
+                    </tr>
+                </thead>
+                <tbody>
+        `;
+        
+        pageData.forEach(row => {
+            tableHTML += `
+                <tr style="border-bottom: 1px solid rgba(255,255,255,0.05); transition: background 0.2s;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
+                    <td style="padding: 1rem;">${row.month}/${row.year}</td>
+                    <td style="padding: 1rem;">${row.department}</td>
+                    <td style="padding: 1rem; color: #10b981;">${formatter.format(row.total_revenue)}</td>
+                    <td style="padding: 1rem; color: #ef4444;">${formatter.format(row.total_expense)}</td>
+                    <td style="padding: 1rem;">${formatter.format(row.net_profit)}</td>
+                </tr>
+            `;
+        });
+        
+        tableHTML += `</tbody></table>`;
+        tableContainer.innerHTML = tableHTML;
+
+        // Bind sort clicks
+        tableContainer.querySelectorAll('.sortable-th').forEach(th => {
+            th.addEventListener('click', (e) => {
+                const col = e.currentTarget.getAttribute('data-col');
+                if (this.sortCol === col) this.sortDesc = !this.sortDesc;
+                else { this.sortCol = col; this.sortDesc = true; }
+                this.renderTable();
+            });
+        });
     }
 
     renderCharts(data, latestYear) {
@@ -215,6 +295,18 @@ class DashboardController {
                     ]
                 },
                 options: {
+                    onClick: (evt, elements) => {
+                        if (elements.length > 0) {
+                            const idx = elements[0].index;
+                            const dept = this.pieChart.data.labels[idx];
+                            this.currentFilterDept = (this.currentFilterDept === dept) ? null : dept;
+                            this.filteredData = this.currentFilterDept 
+                                ? this.fullData.filter(d => d.department === this.currentFilterDept) 
+                                : this.fullData;
+                            this.currentPage = 1;
+                            this.renderTable();
+                        }
+                    },
                     responsive: true,
                     plugins: {
                         legend: { labels: { color: '#f8fafc', font: { family: 'Inter' } } },
@@ -279,6 +371,21 @@ class DashboardController {
             `;
         });
         reviewsContainer.innerHTML = html;
+    }
+
+    exportCSV() {
+        if(!this.filteredData.length) return;
+        const headers = Object.keys(this.filteredData[0]);
+        const csvRows = this.filteredData.map(row => headers.map(h => row[h]).join(','));
+        const csvString = [headers.join(','), ...csvRows].join('\n');
+        
+        const blob = new Blob([csvString], { type: 'text/csv' });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `milano_export_${new Date().getTime()}.csv`;
+        a.click();
+        window.URL.revokeObjectURL(url);
     }
 }
 
@@ -346,7 +453,6 @@ class AuthAndReviewManager {
         
         // Bind Elements
         this.loginBtn = document.getElementById('loginBtn');
-        this.logoutBtn = document.getElementById('logoutBtn');
         this.authModal = document.getElementById('authModal');
         this.authClose = document.getElementById('authClose');
         this.authForm = document.getElementById('authForm');
@@ -354,6 +460,12 @@ class AuthAndReviewManager {
         this.authName = document.getElementById('authName');
         this.toggleAuthMode = document.getElementById('toggleAuthMode');
         this.authToggleText = document.getElementById('authToggleText');
+        this.profileMenu = document.getElementById('profileMenu');
+        
+        this.viewProfileBtn = document.getElementById('viewProfileBtn');
+        this.profileModal = document.getElementById('profileModal');
+        this.profileClose = document.getElementById('profileClose');
+        this.settingsBtn = document.getElementById('settingsBtn');
         
         this.leaveReviewBtn = document.getElementById('leaveReviewBtn');
         this.addReviewForm = document.getElementById('addReviewForm');
@@ -368,8 +480,19 @@ class AuthAndReviewManager {
 
     init() {
         if(this.loginBtn) this.loginBtn.addEventListener('click', () => this.authModal.classList.add('open'));
-        if(this.logoutBtn) this.logoutBtn.addEventListener('click', () => this.handleLogout());
         if(this.authClose) this.authClose.addEventListener('click', () => this.authModal.classList.remove('open'));
+        
+        // Profile Modal Listeners
+        if(this.viewProfileBtn) this.viewProfileBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            if(this.profileModal) this.profileModal.classList.add('open');
+        });
+        if(this.profileClose) this.profileClose.addEventListener('click', () => this.profileModal.classList.remove('open'));
+        
+        if(this.settingsBtn) this.settingsBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            ToastManager.show("Settings are currently locked in this enterprise environment.", "info");
+        });
         
         if(this.toggleAuthMode) this.toggleAuthMode.addEventListener('click', (e) => {
             e.preventDefault();
@@ -401,12 +524,13 @@ class AuthAndReviewManager {
                         document.getElementById('revName').value = result.name;
                         this.authModal.classList.remove('open');
                         this.handleLogin(result.name);
+                        ToastManager.show(`Account created! Welcome, ${result.name}.`, 'success');
                     } else {
-                        alert(result.message);
+                        ToastManager.show(result.message, 'error');
                     }
                 } catch (err) {
                     console.error("Register Error:", err);
-                    alert("System Error: " + err.message + "\nMake sure your Python API is actively running in the terminal.");
+                    ToastManager.show("System Error: Make sure your Python API is actively running.", 'error');
                 } finally {
                     this.authTitle.innerText = "Create Account";
                 }
@@ -427,12 +551,13 @@ class AuthAndReviewManager {
                     document.getElementById('revName').value = result.name;
                     this.authModal.classList.remove('open');
                     this.handleLogin(result.name);
+                    ToastManager.show(`Identity verified. Welcome back, ${result.name}!`, 'success');
                 } else {
-                    alert(result.message);
+                    ToastManager.show(result.message, 'error');
                 }
             } catch (err) {
                 console.error("Login Error:", err);
-                alert("System Error: " + err.message + "\nMake sure your Python API is actively running.");
+                ToastManager.show("System Error: Make sure your Python API is actively running.", 'error');
             } finally {
                 this.authTitle.innerText = "Sign In";
             }
@@ -449,6 +574,7 @@ class AuthAndReviewManager {
             newReview.className = 'review-card';
             newReview.innerHTML = `<div class="review-author">${document.getElementById('revName').value}</div><div class="review-role">${document.getElementById('revRole').value}</div><div class="review-text">"${document.getElementById('revText').value}"</div>`;
             reviewsContainer.insertBefore(newReview, reviewsContainer.firstChild);
+            ToastManager.show("Your insight has been published.", "success");
             this.addReviewForm.reset();
             this.addReviewForm.style.display = 'none';
         });
@@ -461,8 +587,25 @@ class AuthAndReviewManager {
         setTimeout(() => {
             this.transitionOverlay.classList.remove('open');
             this.loginBtn.style.display = 'none';
-            this.logoutBtn.style.display = 'inline-block';
-            this.logoutBtn.textContent = `Log Out (${name})`;
+            
+            if (this.profileMenu) {
+                this.profileMenu.style.display = 'inline-block';
+                document.getElementById('profileName').textContent = name;
+                document.getElementById('userAvatar').textContent = name.charAt(0).toUpperCase();
+                
+                // Populate the new Profile Modal
+                const profileModalAvatar = document.getElementById('profileModalAvatar');
+                const profileModalName = document.getElementById('profileModalName');
+                if (profileModalAvatar) profileModalAvatar.textContent = name.charAt(0).toUpperCase();
+                if (profileModalName) profileModalName.textContent = name;
+                
+                // Re-bind exact logout functionality to the dropdown item
+                const dropLogout = document.getElementById('logoutBtn');
+                if(dropLogout) dropLogout.addEventListener('click', (e) => { e.preventDefault(); this.handleLogout(); }, {once: true});
+            }
+
+            const exportDropdown = document.getElementById('exportDropdown');
+            if (exportDropdown) exportDropdown.style.display = 'inline-block';
             if (this.refreshBtn) this.refreshBtn.style.display = 'inline-block';
             
             this.aboutSection.style.display = 'none';
@@ -479,13 +622,39 @@ class AuthAndReviewManager {
             this.dashboardContent.style.display = 'none';
             this.aboutSection.style.display = 'block';
             this.loginBtn.style.display = 'inline-block';
-            this.logoutBtn.style.display = 'none';
+            
+            if (this.profileMenu) this.profileMenu.style.display = 'none';
+            const exportDropdown = document.getElementById('exportDropdown');
+            if (exportDropdown) exportDropdown.style.display = 'none';
             if (this.refreshBtn) this.refreshBtn.style.display = 'none';
+            this.init(); // re-initialize bindings
         }, 500);
     }
 }
 
-// 6. Application Bootstrapper
+// 6. Global Toast Notification Manager
+class ToastManager {
+    static show(message, type = 'info') {
+        let container = document.getElementById('toastContainer');
+        if (!container) {
+            container = document.createElement('div');
+            container.id = 'toastContainer';
+            container.className = 'milano-toast-container';
+            document.body.appendChild(container);
+        }
+        const toast = document.createElement('div');
+        toast.className = `milano-toast ${type}`;
+        toast.innerText = message;
+        container.appendChild(toast);
+        setTimeout(() => toast.classList.add('show'), 10);
+        setTimeout(() => {
+            toast.classList.remove('show');
+            setTimeout(() => toast.remove(), 400);
+        }, 3500);
+    }
+}
+
+// 7. Application Bootstrapper
 document.addEventListener('DOMContentLoaded', () => {
     const apiProvider = new APIProvider('http://localhost:8080/api/expenses');
     new DashboardController(apiProvider);
